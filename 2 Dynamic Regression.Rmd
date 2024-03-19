@@ -1,0 +1,390 @@
+---
+title: "Dynamic Regression: a case study to analyze the impact of carbon emissions in global warming"
+subtitle: "Time Series Analysis and Forecasting, Master in Big Data Analytics"
+author: "Javier Nogales"
+date: 'UC3M, 2024'
+output:
+  html_document: 
+    css: my-theme.css
+    theme: cerulean
+    highlight: tango
+    number_sections: no
+    toc: no
+    toc_depth: 1
+  pdf_document:
+    css: my-theme.css
+    theme: cerulean
+    highlight: tango
+    number_sections: yes
+    toc: yes
+    toc_depth: 1
+editor_options:
+  chunk_output_type: inline
+---
+
+```{r global_options, include=T, echo = F}
+knitr::opts_chunk$set(echo = T, warning=FALSE, message=FALSE)
+```
+
+```{r, echo=FALSE}
+htmltools::img(src = knitr::image_uri(file.path("uc3m.jpg")), 
+               alt = 'logo', 
+               style = 'position:absolute; top:0; right:0; padding:10px;',
+               width="600",
+               height="80")
+```
+
+# Introduction: global warming
+
+Analize now the effect of CO2 emissions on global warming
+
+```{r}
+library(tidyverse) 
+library(lubridate) 
+library(fpp3)
+
+Sys.setlocale(locale="en_GB.UTF-8") # English labels for dates
+```
+
+Data downloaded from https://www.esrl.noaa.gov/gmd/ccgg/trends/data.html
+
+Monthly mean CO2 mole fraction at Mauna Loa Observatory, Hawaii
+
+It contains the longest record of direct measurements of CO2 in the atmosphere
+
+The mole fraction of CO2, expressed as parts per million (ppm)
+is the number of molecules of CO2 in every one million molecules of dried air (water vapor removed)
+
+```{r}
+co2_data = read.table("https://www.esrl.noaa.gov/gmd/webdata/ccgg/trends/co2/co2_mm_mlo.txt")
+
+co2_ts = ts(co2_data[,5], start=c(1958,3), frequency=12) %>% as_tsibble()
+
+# Carbon emissions trend:
+co2_ts %>% ggplot(aes(x=as.Date(index) , y=value)) + geom_line(col="blue", linewidth = 1.5) + scale_x_date(date_labels="%Y", date_breaks="5 year") + 
+  labs(title = 'CO2 emissions', subtitle="Monthly mean CO2 at Mauna Loa Observatory",
+       caption = "Data https://www.esrl.noaa.gov/gmd/ccgg/trends/data.html", x = '', y = 'parts per million') + theme_minimal()
+
+names(co2_ts)[2] = 'co2'
+```
+
+It seems a clear increasing rate, somehow non-linear (quadratic, most likely). 
+
+Download again the **temperature anomalies** from: https://data.giss.nasa.gov/gistemp
+
+
+```{r}
+# Global-mean monthly, seasonal, and annual means
+temp_data = read.csv("https://data.giss.nasa.gov/gistemp/tabledata_v4/GLB.Ts+dSST.csv", header=T, skip=1, sep=",", na.strings="***")
+
+temp_data <- temp_data[,c(1:13)]  
+gtemp_ts = ts(as.vector(t(temp_data[,2:13])), start=c(1880,1), frequency=12) %>% as_tsibble() %>% drop_na()
+# we are removing NAs in 2024
+```
+
+Merge both datasets:
+
+```{r}
+global.data = merge(gtemp_ts, co2_ts, by="index") %>% as_tsibble(index=index)
+
+tail(global.data)
+```
+
+```{r}
+str(global.data$index)
+```
+
+
+# Simple static regression
+
+Training set: from 2001 to 2022
+
+Testing set: 2023
+
+```{r}
+cor(global.data$value, global.data$co2)
+```
+
+```{r}
+# Type here a simple linear model
+
+train = global.data |> filter(year(index) <= "2022")
+test = global.data |> filter(year(index) > "2022")
+
+simple.reg <- lm(value ~ co2, filter(global.data,year(index)>=2000, year(index)<2023))
+  
+summary(simple.reg)
+```
+
+Insights?
+
+Model: $T_t = -3.3 + 0.01 * co2_t$
+
+## Forecasting
+
+Let's plot the real observations and the forecasts (in the training set)
+
+```{r, eval=F}
+# Type here the plot
+
+predicted_values = predict(simple.reg, newdata = global.data %>% filter(year(index) > "2022"))
+
+predicted_values
+```
+
+```{r}
+cor(predicted_values, test$value)^2
+mean(abs(predicted_values - test$value))
+```
+
+```{r}
+global.data %>% filter(year(index)>=2000, year(index)<2023) %>% ggplot(aes(x=index, y=value)) + geom_line(color="red", size=1.2) + geom_line(y=predict(simple.reg)) + theme_minimal()
+```
+
+```{r}
+head(train)
+# ARIMA -> log(temp)
+# LR -> log(CO2)
+```
+
+```{r}
+
+simple.reg.2 = lm(value ~ co2 + co2 + as.factor(month(index)) + year(index), filter(global.data, year(index) >= 2000, year(index) < 2023))
+
+summary(simple.reg.2)
+```
+
+```{r}
+global.data %>% filter(year(index) >= 2000, year(index) < 2023) %>% ggplot(aes(x=index, y=value)) + geom_line(color="red", size=1.2) + geom_line(y=predict(simple.reg.2)) + theme_minimal()
+```
+
+```{r}
+# Generate predicted values
+predicted_values <- predict(simple.reg.2, newdata = global.data)
+
+# Calculate correlation
+correlation <- cor(global.data$value, predicted_values, use = "complete.obs")
+
+# Calculate Mean Absolute Error (MAE)
+MAE <- mean(abs(global.data$value - predicted_values), na.rm = TRUE)
+
+# Print correlation and MAE
+print(paste("Correlation: ", correlation))
+print(paste("Mean Absolute Error: ", MAE))
+```
+
+
+```{r}
+simple.reg.3 = lm(value ~ I(co2^2) + as.factor(month(index)) + year(index), filter(global.data, year(index) >= 2000, year(index) < 2023))
+
+summary(simple.reg.3)
+
+# Generate predicted values
+predicted_values <- predict(simple.reg.3, newdata = global.data)
+
+# Calculate correlation
+correlation <- cor(global.data$value, predicted_values, use = "complete.obs")
+
+# Calculate Mean Absolute Error (MAE)
+MAE <- mean(abs(global.data$value - predicted_values), na.rm = TRUE)
+
+# Print correlation and MAE
+print(paste("Correlation: ", correlation))
+print(paste("Mean Absolute Error: ", MAE))
+```
+
+```{r}
+acf(residuals(simple.reg)) # Starts at 0
+pacf(residuals(simple.reg)) # Starts at 1
+```
+```{r}
+# Seasonal difference: 
+# y_t - y_{t-12} -> Removing seasonality with lags
+# y_t + month(t) -> Removing with 12 column dummies
+```
+
+
+Insights?
+
+
+# Manual dynamic regression
+
+From previous acf and pacf, we can guess an AR(2) model for $\eta_t$.
+
+Seeing how we have included `co2`, there is no need to treat the trend and seasonality.
+
+`S.E.` = Standard Error
+
+```{r}
+# Training set
+## 
+fit <- global.data %>% filter(year(index)>2010, year(index)<2023) %>% 
+  model(ARIMA(value ~ co2 + I(co2^2) + pdq(p=2, d=0, q=0) + PDQ(P=0, D=0, Q=0))) 
+report(fit)
+```
+
+Residuals
+
+```{r}
+fit %>% gg_tsresiduals(lag=36)
+```
+
+Do we need auto-correlations and seasonal effects?
+
+Let's plot the real observations and the forecasts
+
+```{r}
+forecast(fit, new_data = filter(global.data, year(index)>=2023)) %>% autoplot(filter(global.data, year(index)>=2015))  + theme_minimal()
+```
+
+Insights?
+
+
+# Automatic dynamic regression
+
+We expect an increase in temperature after an increase in co2 some time before, so let's add a lag in the predictor and fit an automatic arima
+
+```{r}
+fit <- global.data %>% mutate(year=year(index)) %>%
+  filter(year(index)>=2010, year(index)<2023) %>% # training set
+  model(ARIMA(value ~ year + co2 + lag(co2,12*1), stepwise=F)) 
+report(fit)
+```
+
+We can also try a model without the lag in the predictor
+
+```{r}
+# try here other models
+
+```
+
+The residuals:
+
+```{r}
+fit %>% gg_tsresiduals()
+```
+
+The residuals seem better: more white noise
+
+
+## Forecasting
+
+Before forecasting the global temperature, we need to forecast first the carbon emissions
+
+To capture better the CO2 trend, we can enlarge the training set for the CO2 series
+
+```{r}
+# Automatic forecasting for CO2
+fit_co2 <- co2_ts %>% filter(year(index)>=2000,year(index)<2023) %>% 
+model(ARIMA(co2, stepwise=F))
+report(fit_co2)
+
+# Forecasts co2 24 months ahead:
+for_co2 = fit_co2 %>%  forecast(h = 24) 
+for_co2 %>% 
+  autoplot(filter(co2_ts, year(index)>=2018), size=2, color="red")
+
+# add new rows with these forecasts
+future_cO2 <- new_data(filter(global.data,year(index)<2023), n = 24) %>% mutate(co2 = for_co2$.mean, year=year(index))
+
+
+```
+
+Now we are ready to forecast our main target variable
+
+```{r}
+fit %>%  forecast(new_data = future_cO2) %>% 
+  autoplot(filter(global.data, year(index)>=2014), size=2, color="red") +
+  labs(title = "Global monthly-mean temperature anomaly",subtitle='Monthly forecasts for 2021 by forecasting first the CO2', x='', y = '°C') + theme_minimal()
+
+fit %>%  forecast(new_data = future_cO2) %>% fabletools::accuracy(global.data) 
+```
+
+Insights?
+
+# What is the relation between carbon emissions and global warming?
+
+Let's analyze now the possible relation between carbon emissions and global warming
+
+To do that, let's compare the 10-years change in temperature when there is a 10-years change in co2
+
+Moreover, we can consider the last available observations: we are interested in explaining, not in forecasting
+
+First, consider just annual data with logs in CO2
+
+```{r}
+annual.data = global.data %>% mutate(year=year(index)) 
+annual.data$index = NULL
+annual.data = annual.data %>% filter(year<2024) %>% group_by(year) %>% summarise(value=mean(value), co2=mean(log(co2)))
+```
+
+Now, add differences from 10 years ago
+
+```{r}
+annual.data = annual.data %>% mutate(temp_diff10 = difference(value,10), co2_diff10 = difference(co2,10)) %>% filter(year>=1970)
+
+annual.data %>% select(-value,-co2) %>%
+  pivot_longer(c(temp_diff10, co2_diff10),
+               names_to = "var", values_to = "value") %>%
+  mutate(var = recode(var, "temp_diff10" = "temperature change", "co2_diff10" = "co2 change")) %>%
+  ggplot(aes(x = year, y = value)) +
+  geom_line(size=1) + geom_smooth(se=F,span=1.2)+
+  #scale_x_yearmonth(date_labels="%Y", date_breaks = "2 year") +
+  facet_grid(vars(var), scales = "free_y") +
+  labs(title = "10-year changes in CO2 emissions (log of ppm) and temperature anomalies (°C deviations) from 1970",x="", y = "10-year difference")+theme_minimal()
+
+```
+
+Changes in co2 seem to increase faster than changes in temperature
+
+Let's try a dynamic regression model:
+
+```{r}
+annual.data = annual.data %>% as_tsibble(index=year)
+fit = annual.data %>% 
+  model(ARIMA(temp_diff10 ~ trend() + co2_diff10 + lag(co2_diff10,1) , stepwise=F))
+
+report(fit)
+
+fit %>% gg_tsresiduals()
+```
+
+The fitted model shows how changes in c02 significantly affect changes in temperatures
+
+
+# Scenario based forecasting
+
+What will happen to temperatures in 10 years under different scenario-changes in co2?
+
+```{r}
+future_scenarios <- scenarios(
+  BigIncrease = new_data(annual.data, 10) %>%
+    mutate(co2_diff10=seq(0.06,0.08,length.out=10)),
+  NoIncrease = new_data(annual.data, 10) %>%
+    mutate(co2_diff10=0.061),
+  ExpectedIncrease = new_data(annual.data, 10) %>%
+    mutate(co2_diff10=seq(0.06,0.07,length.out=10)),  
+  SmallDecrease = new_data(annual.data, 10) %>%
+    mutate(co2_diff10=seq(0.06,0.05,length.out=10)),    
+  names_to = "Scenario")
+
+fc <- forecast(fit, new_data = future_scenarios)
+
+annual.data %>% filter(year>=2000) %>%
+  autoplot(temp_diff10) +
+  autolayer(fc, level = NULL) + 
+  geom_hline(yintercept=0, linetype="dashed", color = "navyblue")+  
+  scale_y_continuous(limits = c(-0.1,0.6))+
+  labs(title = "Global warming: 10-years changes", y = "10-years temperature change", x="")+
+  theme_minimal()
+```
+
+We expect (expected scenario) a 10-years change in temperature around 0.4 ºC in 2033, that means an increase of 0.04 ºC per year.
+
+Note even if changes in co2 emissions remains at current change (around 0.06), temperatures will increase in 10 years in around 0.25 degrees.
+
+But if 10-years change in co2 are decreased in 10 years from 0.06 to 0.05, change in temperature will be around 0.14 degrees (0.014 ºC per year).
+
+
+
+
