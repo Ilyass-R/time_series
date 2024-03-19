@@ -1,0 +1,247 @@
+---
+title: "Multivariate Time-Series Models: a case study to analyze macro-economic time series"
+subtitle: "Time Series Analysis and Forecasting, Master in Big Data Analytics"
+author: "Javier Nogales"
+date: 'UC3M, 2024'
+output:
+  html_document: 
+    css: my-theme.css
+    theme: cerulean
+    highlight: tango
+    number_sections: no
+    toc: no
+    toc_depth: 1
+  pdf_document:
+    css: my-theme.css
+    theme: cerulean
+    highlight: tango
+    number_sections: yes
+    toc: yes
+    toc_depth: 1
+editor_options:
+  chunk_output_type: inline
+---
+
+```{r global_options, include=T, echo = F}
+knitr::opts_chunk$set(echo = T, warning=FALSE, message=FALSE)
+```
+
+```{r, echo=FALSE}
+htmltools::img(src = knitr::image_uri(file.path("uc3m.jpg")), 
+               alt = 'logo', 
+               style = 'position:absolute; top:0; right:0; padding:10px;',
+               width="600",
+               height="80")
+```
+
+# Introduction
+
+We are going to analyze the dynamic relation between some macro-economic variables from the US: personal income, personal consumption expenditures, industrial production, personal savings rate, unemployment people.
+
+```{r}
+# Ensure the environment is clean
+rm(list=ls())
+
+# Load required libraries
+library(tidyverse) # great collection of packages to visualize and manage datasets
+library(lubridate) # to work with dates
+library(fpp3)
+```
+
+Download data using Quandl
+
+```{r}
+library(eFRED) # variables from FRED
+
+# US personal income (quarterly), Personal Consumption Expenditures, Industrial Production, Personal savings rate, Unemployment people (in thousands)
+
+# Download all the variables and compute quarterly percentage differences
+
+data.fred = fred(c("PINCOME", "PCE", "INDPRO", "PSAVERT", "UNEMPLOY"))
+data.fred = data.fred %>% filter(year(date)>=1990) %>% drop_na()
+names(data.fred) = c('Date', 'Income', 'Consumption', 'Production', 'Savings', 'Unemployment')
+
+# Original variables
+data.fred %>%
+  pivot_longer(c(2:6), names_to = "var", values_to = "value") %>%
+  ggplot(aes(x = Date, y = value)) +
+  geom_line() + 
+  facet_grid(vars(var), scales = "free_y") + theme_minimal()+
+  labs(title = "US macro-economic variables",
+       y = "")
+```
+
+Insights? How are variables affecting each other?
+
+We should make the variables stationary:
+
+```{r}
+# Ask GPT to explain this code:
+data.fred = data.fred %>% mutate(across(where(is.numeric),  ~  (.x-lag(.x))/.x)) %>% filter(year(Date)>=1991)
+
+#save(data.fred, file="macrovariables.RData")
+#load("macrovariables.RData")
+
+data.fred %>%
+  pivot_longer(c(2:6), names_to = "var", values_to = "value") %>%
+  ggplot(aes(x = Date, y = value)) +
+  geom_line() + scale_y_continuous(labels = scales::percent_format(accuracy = .1))+
+  facet_grid(vars(var), scales = "free_y") + theme_minimal()+
+  labs(title = "US macro-economic variables (in quarterly differences)",
+       y = "Quarterly % change")
+```
+
+# Outliers
+
+```{r}
+library(tsoutliers)
+
+# Identify outliers in an outmatic way
+# Loop for each variable in data.fred
+for (var in names(data.fred)[-1]) {
+  ts_data <- ts(data.fred[[var]], start=c(1991,1), frequency=4)
+  
+  # Detect outliers
+  outliers <- tso(ts_data)
+  
+  # Check the results
+  print(outliers)
+  plot(outliers)
+  
+  # Add the adjusted data back to the data frame
+  data.fred[[paste0(var, ".adjusted")]] <- outliers$yadj
+}
+
+# Check the updated data frame structure
+names(data.fred)
+```
+
+Now we decide if we want to work with the original time series or the filtered one. One choice is to work with the filtered one in the training set, and the original one in the testing one.
+
+# VAR models
+
+Let's fit an automatic VAR model (using fable) based on $bic$ to select the best model
+
+```{r}
+dataUS = data.fred %>% select(-Date) %>% 
+  ts(start=c(1991,1), frequency=4) %>% as_tsibble(pivot_longer = FALSE) %>% drop_na()
+
+# leave 2022 and 2023 for testing
+fit <-  dataUS %>% filter(year(index)<2022) %>%
+  model(VAR1=VAR(vars(Income.adjusted, Consumption.adjusted, Savings.adjusted, Production.adjusted, Unemployment.adjusted) ~ 0+AR(1)),
+        aicc=VAR(vars(Income.adjusted, Consumption.adjusted, Savings.adjusted, Production.adjusted, Unemployment.adjusted), ic="aicc" ),
+        bic=VAR(vars(Income.adjusted, Consumption.adjusted, Savings.adjusted, Production.adjusted, Unemployment.adjusted), ic="bic")
+  )
+
+fit
+glance(fit)
+```
+
+BIC is simpler than AICc because it penalizes more the model complexity
+
+```{r}
+report(fit$VAR1[[1]])
+```
+
+How many parameters are estimated?
+
+```{r}
+fit %>%
+  augment() %>%
+  ACF(.innov) %>%
+  autoplot()
+```
+
+Residuals are better for AICc but BIC model is simpler.
+
+## Forecasting
+
+Let's forecast 2 years ahead:
+
+Consider first, in the testing set, the actual values instead of the adjusted ones
+
+```{r}
+n_rows <- nrow(dataUS)
+dataUS[(n_rows-7):n_rows, 7:11] <- dataUS[(n_rows-7):n_rows, 2:6]
+```
+
+Accuracy:
+
+```{r}
+fit%>%
+  forecast(h=8)  %>% accuracy(dataUS)
+```
+
+Forecasting plot for the next 2 years:
+
+```{r}
+fit%>%
+  forecast(h=8) %>% 
+  autoplot(dataUS %>% filter(year(index) >= 2019), level = NULL)
+```
+
+Insights?
+
+# VAR models in high dimension
+
+Let's use the **bigtime** library to sparsely estimate large multivariate time-series models This library estimates big VARMA models using an L1-penalty (lasso penalty)
+
+Estimation:
+
+```{r}
+library(bigtime)
+
+VAR.L1 <- sparseVAR(Y=scale(as.matrix(head(dataUS[,-c(1:6)],-8))), # leave 2022 and 2023 for testing
+                    h = 1, # evaluate forecasts 1 quarter ahead
+                    selection = "cv", # using time series cross-validation
+                    VARpen = "L1") # using the lasso penalty)
+
+plot_cv(VAR.L1)
+```
+
+As with `glmnet`, this library plots the mean forecasting error for each penalization together with error bars for plus-minus one standard deviation.
+
+The black dashed line indicates the penalty parameter choice that lead to the smallest MSFE in the CV procedure: better for forecasting. The red dotted line, on the other hand, shows the one-standard-error solution: better for interpretation.
+
+Let's see the lag matrix between predictors and responses:
+
+```{r}
+LhatL1 <- lagmatrix(fit=VAR.L1, returnplot=TRUE)
+```
+
+The 0 for (Unemployment.adjusted, Consumption.adjusted) corresponds to the $cor((z^5)_t, < (z^1)_{t-1})$
+
+We have applied a multivariate approach, but the results of the model indicate that the results are multiple.
+
+## Forecasting
+
+They can be direct for just one period (that must be the same h as in the estimation), or recursive (for many periods up to the horizon)
+
+```{r}
+# 1-quarter ahead direct forecasts
+directforecast(VAR.L1, h=1)
+
+# 2-year ahead recursive forecasts
+forecast_data = as.data.frame(recursiveforecast(VAR.L1, h=8)$fcst)
+forecast_data = forecast_data %>% mutate(index = tail(dataUS$index,8))
+
+# real values for 2022 and 2024
+actual_data = tail(dataUS[,1:6],8)
+
+# Combine the actual and forecast data into long format for plotting
+actual_long <- pivot_longer(actual_data, -index, names_to = "Variable", values_to = "Actual")
+forecast_long <- pivot_longer(forecast_data, -index, names_to = "Variable", values_to = "Forecast")
+forecast_long$Variable <- sub(".adjusted", "", forecast_long$Variable) # Remove '.adjusted' for matching
+
+# Merge actual and forecast data
+combined_data <- merge(actual_long, forecast_long, by = c("index", "Variable"))
+
+# Plotting
+ggplot(combined_data, aes(x = index)) + 
+  geom_line(aes(y = Actual, colour = "Actual")) + 
+  geom_line(aes(y = Forecast, colour = "Forecast")) + 
+  facet_wrap(~ Variable, scales = "free_y", nrow = 5) + 
+  theme_minimal() + 
+  labs(colour = "Type") + 
+  scale_colour_manual(values = c("Actual" = "blue", "Forecast" = "red"))
+```
