@@ -1,0 +1,453 @@
+---
+title: "Machine Learning for Time-Series Forecasting"
+subtitle: "Time Series Analysis and Forecasting, Master in Big Data Analytics"
+author: "Javier Nogales"
+date: 'UC3M, 2024'
+output:
+  html_document: 
+    css: my-theme.css
+    theme: cerulean
+    highlight: tango
+    number_sections: no
+    toc: yes
+    toc_depth: 1
+  pdf_document:
+    css: my-theme.css
+    theme: cerulean
+    highlight: tango
+    number_sections: yes
+    toc: yes
+    toc_depth: 1
+editor_options:
+  chunk_output_type: console
+---
+
+```{r global_options, include=T, echo = F}
+knitr::opts_chunk$set(echo = T, warning=FALSE, message=FALSE)
+```
+
+```{r, echo=FALSE}
+htmltools::img(src = knitr::image_uri(file.path("uc3m.jpg")), 
+               alt = 'logo', 
+               style = 'position:absolute; top:0; right:0; padding:10px;',
+               width="600",
+               height="80")
+```
+
+# Introduction
+
+In this computer lab, we will learn how to use automatic tools to forecast time series, including statistical models like exponential smoothing and ARIMA models, but now with emphasizing machine learning tools like random forests or neural networks.
+
+In particular, we will learn how to manage the package **`modeltime`**.
+
+```{r}
+# Ensure the environment is clean
+rm(list=ls())
+
+# Load the required libraries
+library(tidyverse) # great collection of packages to visualize and manage datasets
+library(lubridate) # to work with dates
+library(fpp3)
+library(tsibble) # tidy data structure for time series
+library(tidymodels) # machine learning ecosystem of packages (the new caret)
+library(modeltime) # automatic forecasting using machine learning
+library(modeltime.ensemble) # ensembles   
+library(timetk) # similar to tidyverse but for time series (visualization and management of times series)
+```
+
+## Maximum temperatures in Madrid
+
+Using data from AEMET, we will download daily maximum temperatures in Madrid, from 1950, and then aggregate them into monthly maximum temperatures
+
+As a summary, in Madrid the summers are hot, dry, and mostly clear and the winters are cold and partly cloudy.
+
+Hence, the goal will be to forecast monthly maximum temperatures in Madrid.
+
+```{r}
+# Use .RData
+load("temperatures.RData")
+
+# Library to connect to the Spanish Meteorological Agency (AEMET) using its API 
+#library(climaemet)
+#aemet_stations()
+
+# select here a station
+#station <- "3195" # Madrid Retiro
+
+#temp_dat <-
+#  aemet_daily_clim(station, start = "1960-01-01", end = "2024-02-29")
+#save(temp_dat, file="temperatures.RData")
+
+
+# Aggregate to month
+temp_month = temp_dat %>% 
+  mutate(year.month=yearmonth(fecha)) %>% 
+  group_by(year.month) %>%
+  summarise(max=max(tmax, na.rm=T)) %>% 
+  arrange(year.month)
+
+# Convert into ts
+gtemp_ts = ts(temp_month$max, start=c(1960,1), frequency=12) %>% 
+  as_tsibble() %>% 
+  drop_na()
+```
+
+## Seasonal plot
+
+```{r}
+temp_month %>% 
+  mutate(month=as.factor(month(year.month, label=T, abbr=T))) %>%
+  group_by(month) %>%
+  mutate(medTemp = mean(max, na.rm = T)) %>%
+  ggplot(aes(x=month, y=max, group=month, fill=medTemp, color=medTemp)) +
+  geom_boxplot() +
+    scale_fill_gradient(low="lightblue",high="orange") +
+  scale_color_gradient(low="blue",high="red") +  
+  labs(title="Maximum temperatures in Madrid (Retiro) per month of the year",
+  subtitle = "Data from 1960 to 2024", y = "Maximum temperature in ºC", x = "") +
+  theme_minimal() +
+    theme(plot.background = element_rect(fill='#212121'), text=element_text(size=14,color='#FFFFFF'),
+        axis.text = element_text(color='#FFFFFF'), panel.grid.major.y = element_line(color = '#55565B', linetype = "dotted"),panel.grid.major.x = element_line(color = '#55565B', linetype = "dotted"),
+        panel.grid.minor.y = element_blank(),panel.grid.minor.x = element_blank(),
+        plot.title=element_text(size=20), legend.position="none")
+```
+
+The hottest month in Madrid was June/2019, August/2021, and July/2022, with $40.7 ºC$.
+
+# Machine-learning tools with modeltime
+
+The **`modeltime`** package also considers tidy data, and build the time-series models using the `tidymodels` (new caret).
+
+Hence, better to get some basic skills using `tidymodels`: <https://www.tidymodels.org/start/>
+
+Somehow, `modeltime` combines the library `fable` (for time series, no ML) with the library `tidymodels` (for machine learning, no time series)
+
+With `modeltime`, we can train many models at the same time (arima, prophet, random forests, xgboost, neural networks, etc.)
+
+Developed by Matt Dancho: <https://business-science.github.io/modeltime/>
+
+```{r}
+# we need to change the format of the index date
+gtemp_ts$index = as.Date(gtemp_ts$index)
+
+gtemp_ts %>%
+  plot_time_series(.date_var=index, .value=value, .interactive = TRUE,
+                   .title='Maximum temperatures in Madrid center from 1950',
+                   .y_lab = "Monthly data in °C") 
+```
+
+The maximum temperature has increased in about 2 degrees in the last 70 years.
+
+## Seasonal plot with modeltime:
+
+```{r}
+gtemp_ts %>%
+    plot_seasonal_diagnostics(index, value, .interactive = T)
+```
+
+Time-series decomposition with `modeltime`:
+
+```{r}
+gtemp_ts %>%
+    plot_stl_diagnostics(index, value,
+        .frequency = "auto", .trend = "auto",
+        .feature_set = c("observed", "season", "trend", "remainder"),
+        .interactive = T)
+```
+
+In an easy way, we can split the time series into training and testing sets (using the `timetk` library).
+
+## Train-test split (just once)
+
+Last 12-months of data as the testing set, the other 20 years is the training:
+
+```{r}
+# forecasting horizon = 1 year
+# training window = 20 years
+
+splits <- gtemp_ts %>%
+  time_series_split(date_var = index, initial = "20 years", assess  = "1 year")
+
+# visualize the split
+splits %>%
+  tk_time_series_cv_plan() %>%
+  plot_time_series_cv_plan(index, value, .interactive = FALSE)
+```
+
+## Time-series cross-validation
+
+Let's try a 5-fold time-series cross-validation:
+
+In real time-series, because they are non-stationary, it is usually better to consider a fixed training window than an expanding/sliding one:
+
+```{r}
+# forecasting horizon = 1 year
+# training window = 20 years, always fixed (cumulative=F)
+# forecast every year
+
+splits <- time_series_cv(data = filter(gtemp_ts), 
+                         date_var = index,
+                         initial     = "15 years", # window for train set
+                         assess      = "1 year", # h = 12 months
+                         skip        = "12 months", # forecast once per year
+                         slice_limit = 5, # maximum number of blocks/slices
+                         cumulative  = FALSE)
+
+# visualize the splits
+splits %>%
+    plot_time_series_cv_plan(index, value, .interactive = FALSE)
+```
+
+Note how the train set contains always 15 years while the test set contains 1 year.
+
+## Train
+
+Train the models in an automatic way: first an auto.arima, then with `prophet`.
+
+We are going to select the first split (forecast the Mar-2023 to Feb-2024 using the previous 15 years), but we can select any other
+
+Train three basic models, no ML: auto.arima, ets, and prophet.
+
+```{r}
+sp = 1 # select here the split
+
+# First the auto.arima of Hyndman
+model_fit_arima = 
+  arima_reg() %>% 
+  # arima_reg(seasonal_period = 12, seasonal_differences = 1, non_seasonal_differences = 1) %>%
+  set_engine("auto_arima") %>%
+  fit(value ~ index, training(splits$splits[[sp]])) 
+# modeltime models require a date column to be a regressor
+
+model_fit_arima
+
+# Error-Trend-Season (ETS) model
+model_fit_ets = 
+  exp_smoothing() %>% 
+  set_engine("ets") %>%
+  fit(value ~ index, training(splits$splits[[sp]])) 
+
+model_fit_ets
+
+# Now the prophet by facebook
+model_fit_prophet <- prophet_reg() %>%
+  set_engine("prophet", monthly.seasonality = TRUE) %>%
+  fit(value ~ index, training(splits$splits[[sp]]))
+model_fit_prophet
+```
+
+# Machine Learning for time series
+
+ML tools in time series are more difficult to deal with because we need to create first the relevant features.
+
+## Pre-processing
+
+We are going to create the features using recipe objects (with steps).
+
+See more details in <https://www.tidymodels.org/>
+
+The recipe:
+
+```{r}
+recipe_spec <- recipe(value ~ index, training(splits$splits[[sp]])) %>%
+  step_timeseries_signature(index) %>%
+  step_rm(contains("am.pm"), contains("hour"), contains("minute"),contains("day"),
+          contains("week"), contains("second"), contains("xts"), contains("iso"), index_month, index_quarter, index_half, index_index.num) %>%
+  step_dummy(all_nominal()) %>%
+  step_fourier(index, K = 2, period = 12) 
+# step_rm is to remove features we are not going to use
+
+# Just to see the data frame with the recipe
+recipe_spec %>% prep() %>% juice() %>% View()
+```
+
+By default, many features are created automatically. Unnecessary features can be removed using `recipes::step_rm()`
+
+## Train
+
+We can fit any model using different computational engines
+
+See more details in <https://www.tidymodels.org/>
+
+Let's try `glmnet`, `random forest`, `XGBoost`, `neural networks`, and `prophet`.
+
+For each model, we need to define a workflow: container that aggregates information required to fit and predict (model+features+train)
+
+```{r}
+# glmnet
+model_spec_glmnet <- linear_reg(penalty = 0.01, mixture = 0.5) %>%
+  set_engine("glmnet")
+
+# Hyper-parameters can be optimized in this way: https://business-science.github.io/modeltime/articles/parallel-processing.html
+
+workflow_fit_glmnet <- workflow() %>%
+  add_model(model_spec_glmnet) %>%
+  add_recipe(recipe_spec %>% step_rm(index)) %>%
+  fit(training(splits$splits[[sp]]))
+
+# randomForest
+model_spec_rf <- rand_forest(trees = 500, mode = "regression") %>%
+  set_engine("randomForest")
+
+workflow_fit_rf <- workflow() %>%
+  add_model(model_spec_rf) %>%
+  add_recipe(recipe_spec %>% step_rm(index)) %>%
+  fit(training(splits$splits[[sp]]))
+
+# XGBoost
+model_spec_xgboost <- boost_tree(mode = "regression") %>%
+    set_engine("xgboost")
+
+wflw_fit_xgboost <- workflow() %>%
+    add_model(model_spec_xgboost) %>%
+    add_recipe(recipe_spec %>% step_rm(index)) %>%
+    fit(training(splits$splits[[sp]]))
+
+# NNETAR
+model_spec_nnetar <- nnetar_reg(seasonal_period = 12, mode = "regression") %>%
+    set_engine("nnetar")
+
+wflw_fit_nnetar <- workflow() %>%
+    add_model(model_spec_nnetar) %>%
+    add_recipe(recipe_spec) %>%
+    fit(training(splits$splits[[sp]]))
+
+# Prophet with all the features
+
+model_spec_prophet <- prophet_reg(
+      seasonality_yearly = TRUE
+    ) %>%
+    set_engine("prophet") 
+
+wflw_fit_prophet <- workflow() %>%
+    add_model(model_spec_prophet) %>%
+    add_recipe(recipe_spec) %>%
+    fit(training(splits$splits[[sp]]))
+
+```
+
+The `modeltime` table organizes the models with IDs and creates generic descriptions to help us keep track of our models
+
+```{r}
+model_table <- modeltime_table(
+  model_fit_arima, 
+  model_fit_ets, 
+  model_fit_prophet,
+  workflow_fit_glmnet,
+  workflow_fit_rf,
+  wflw_fit_xgboost,
+  wflw_fit_nnetar,
+  wflw_fit_prophet
+) 
+model_table
+```
+
+## Forecasting
+
+First, model calibration is used to quantify error and estimate confidence intervals.
+
+Model calibration will be performed on the out-of-sample data (testing sets) with the `modeltime_calibrate()` function
+
+```{r}
+calibration_table <- model_table %>%
+  modeltime_calibrate(new_data = testing(splits$splits[[sp]]))
+calibration_table
+```
+
+Now, with calibrated data, we can forecast all the models:
+
+```{r}
+calibration_table %>%
+  modeltime_forecast(actual_data = filter(gtemp_ts,year(index)>=2018)) %>%
+  plot_modeltime_forecast(.interactive = FALSE) + labs(title = "Forecasts",    y = "",    caption = "modeltime"      )
+
+```
+
+Accuracy table in the first testing set:
+
+```{r}
+calibration_table %>%
+  modeltime_accuracy() %>%
+  table_modeltime_accuracy(.interactive = FALSE)
+```
+
+Insights?
+
+## Re-train models for accuracy resample (DO NOT USE; FOR FINAL PROJECT CREATE MANUAL LOOP)
+
+We should run again the previous workflow for the other splits.
+
+To do that, let's resample the accuracy of a model (in our case using the first split) with the other slices (testing sets).
+
+Resample forecasts: for each slice (training set), the model is re-fitted and forecasts (testing set) are provided. That is, we take the model's specification from the first split (just the model type) and refit (re-train) it repeatedly to resampled data (the rest of the splits).
+
+```{r}
+resample_results <- model_table %>%
+  modeltime_fit_resamples(
+    resamples = splits,
+    control   = control_resamples(verbose = TRUE)
+  )
+resample_results
+
+```
+
+Visualize the accuracy for each model and each slice
+
+```{r}
+resample_results %>%
+  plot_modeltime_resamples(
+    .summary_fn  = mean, 
+    .point_size  = 3,
+    .interactive = FALSE
+  )
+```
+
+The average performance:
+
+```{r}
+resample_results %>%
+  modeltime_resample_accuracy(summary_fns = list(mean = mean)) %>%
+  table_modeltime_accuracy(.interactive = FALSE)
+```
+
+Which are the more robust tools across different splits?
+
+That means Arima works well but needs to be re-trained each time. On the other hand, ML tools, specially prophet and rf, do not need to be re-trained as often
+
+# Ensembles
+
+Finally, let's combine the best models using the **simple average ensemble** to forecast 2024
+
+Besides testing data (last available 12 months), we are going to forecast 12 more months (completely not known). I.e. our final forecasting horizon will be $h=24$
+
+```{r}
+
+future.data = testing(splits$splits[[sp]]) %>% future_frame(index, .length_out = "1 year", .bind_data = T)
+
+# calibrate again to obtain longer forecasts
+calibration_table <- model_table %>% modeltime_calibrate(future.data)
+
+# Select here your favourite models
+iaux = c(1, 2, 3, 5) 
+
+# make the ensemble
+ensemble_fit_avg <- calibration_table[iaux,] %>%
+    ensemble_average(type = "mean")
+ensemble_fit_avg
+
+# calibration and performance
+ensemble_fit_avg %>%
+  modeltime_calibrate(testing(splits$splits[[sp]])) %>%
+  modeltime_accuracy() %>%
+  table_modeltime_accuracy(.interactive = FALSE)
+
+ensemble_fit_avg %>% modeltime_table() %>%
+  modeltime_forecast(actual_data = filter(gtemp_ts,year(index)>=2018)) %>%
+  plot_modeltime_forecast(.interactive = FALSE) + labs(title = "24-months ahead forecasts",    y = "",    caption = "modeltime"      ) +
+  scale_x_date(breaks = scales::date_breaks("1 year"),
+               labels = scales::date_format("%Y"))
+```
+
+Seems good performance in 2023, and similar pattern in 2024
+
+During the 2023 summer, max temperatures higher than expected. And at the very end, max temperatures lower than expected.
