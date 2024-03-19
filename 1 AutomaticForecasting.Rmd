@@ -1,0 +1,395 @@
+---
+title: "Automatic Forecasting: a case study to analyze global warming"
+subtitle: "Time Series Analysis and Forecasting, Master in Big Data Analytics"
+author: "Javier Nogales"
+date: 'UC3M, 2024'
+output:
+  html_document: 
+    css: my-theme.css
+    theme: cerulean
+    highlight: tango
+    number_sections: no
+    toc: no
+    toc_depth: 1
+  pdf_document:
+    css: my-theme.css
+    theme: cerulean
+    highlight: tango
+    number_sections: yes
+    toc: yes
+    toc_depth: 1
+editor_options:
+  chunk_output_type: inline
+---
+
+```{r global_options, include=T, echo = F}
+knitr::opts_chunk$set(echo = T, warning=FALSE, message=FALSE)
+```
+
+```{r, echo=FALSE}
+htmltools::img(src = knitr::image_uri(file.path("uc3m.jpg")), 
+               alt = 'logo', 
+               style = 'position:absolute; top:0; right:0; padding:10px;',
+               width="600",
+               height="80")
+```
+
+# Introduction: can we predict global warming?
+
+We will learn how to use automatic tools to forecast time series, including statistical models like exponential smoothing and ARIMA models.
+
+We will learn how to manage two main packages: fable and modeltime
+
+```{r}
+library(tidyverse) # great collection of packages to visualize and manage datasets  
+library(lubridate) # to work with dates
+
+library(tsibble) # tidy data structure for time series
+library(fable) # univariate and multivariate time-series forecasting models
+library(feasts) # Feature Extraction And Statistics for Time Series
+library(fable.prophet) # Automatic forecasting tool developed by Facebook (interface in fable)
+
+library(tidymodels) # machine learning ecosystem of packages (the new caret)
+library(modeltime) # automatic forecasting using machine learning
+library(modeltime.ensemble) # ensembles   
+library(timetk) # similar to tidyverse but for time series (visualization and management of times series)
+```
+
+## Global warming
+
+The world is getting warmer, temperatures around the world have been rising since the Industrial Revolution
+
+To analize global warming, the focus is on **temperature anomalies**: deviations from the corresponding 1951-1980 means
+
+Global temperature records start around 1880, and the period of 1951-1980 was chosen because the U.S. National Weather Service uses a three-decade period to define *normal* or average temperature
+
+Data can be downloaded from: <https://data.giss.nasa.gov/gistemp>
+
+```{r}
+# Global-mean monthly, seasonal, and annual means
+temp_data = read.csv("https://data.giss.nasa.gov/gistemp/tabledata_v4/GLB.Ts+dSST.csv", header=T, skip=1, sep=",", na.strings="***")
+
+temp_data <- temp_data[,c(1:13)]  
+gtemp_ts = ts(as.vector(t(temp_data[,2:13])), start=c(1880,1), frequency=12) %>% as_tsibble() %>% drop_na()
+# we are removing NAs in 2024
+
+# Long-term warming trend
+gtemp_ts %>% ggplot(aes(x=as.Date(index) , y=value)) + geom_line(col="red",linewidth=1.5) + scale_x_date(date_labels="%Y", date_breaks="5 year") +
+  scale_y_continuous(limits=c(-1,1.6)) + 
+  geom_hline(yintercept=0) +
+  labs(title = 'Global monthly-mean temperature anomaly', subtitle="°C deviations from the corresponding 1951-1980 means",
+       caption = "Data from https://data.giss.nasa.gov/gistemp", x = '', y = '°C') + theme_minimal()+  theme(panel.grid.minor.x = element_blank())
+```
+
+The average global temperature on Earth has increased more than 1° Celsius since 1880, roughly at a rate of 0.15-0.20°C per decade since 1975
+
+Can we forecast the global temperatures for the next months/years?
+
+## Initial Thoughts:
+
+Seems to have quadratics behavior: $(y = a + b * time + c * time^2)$
+
+$H_0: d = 1$
+
+Question to ask: Should we consider all of the years or just the last 40 where it starts increasing?
+
+# Manual way (a review)
+
+```{r}
+gs_stl = gtemp_ts |> model(stl = STL(value)) 
+
+components(gs_stl) |> autoplot()
+
+```
+
+Model?
+
+## Manual estimation with fable
+
+Train from 2006 to 2022 (around 200 months), test the next 24 months
+
+```{r}
+# We want to forecast for the years of 2023 and 2024
+fit <- gtemp_ts %>% 
+  filter(year(index) >= 2006, 
+         year(index) < 2023) %>%
+  # enter your model here
+
+
+```
+
+```{r}
+gtemp_ts %>% gg_tsdisplay(y=difference(value), 
+                          plot_type = "partial", 
+                          lag=36)
+
+# We don't have trends but we have seasons
+# It seems like it is an MA(1)
+```
+
+```{r}
+# Including the difference in seasonality
+gtemp_ts %>% gg_tsdisplay(y=difference(difference(value), 12),
+                          plot_type = "partial", 
+                          lag=36)
+```
+
+Insights?
+
+# Automatic forecasting tools
+
+## fable
+
+The **fable** package contains time series models under the tidy data analysis workflow
+
+The package is the next iteration of Rob Hyndman's **forecast** package (which is no longer maintained)
+
+We can train many models at the same time (arima, ets, lm, prophet, etc.)
+
+TSLM: It is a linear model without specifications for the noise (assumed to be white noise) but using a time series framework
+
+ARIMA: automatic function (in fable) to find the *best* ARIMA model (with the lowest AIC or AICc or BIC). It allows for predictors
+
+ETS: automatic function (in fable) to select an exponential smoothing method. It does not allow for predictors
+
+There are many ways to use the Prophet method developed by Facebook: <https://facebook.github.io/prophet/>
+
+There are packages in R and Python, but we can use it through fable:prophet
+
+Moreover, prophet allows for predictors
+
+Let's fit, automatically, multiple arima and ets models and get the best (using AIC)
+
+```{r}
+# It is convenient to define a training set:
+fit <- gtemp_ts %>% 
+  filter(year(index)>=2006, year(index)<2023) %>% 
+  # training set (20 years)
+  model(arima = ARIMA(value),
+        manual_arima = ARIMA(value ~ 0 + pdq(0,1,1) + PDQ(0,1,1)),
+        ets = ETS(value ~ season(c("A","M"), period=12)),
+        lm = TSLM(value ~ I(year(index)^2) + season(period=12)),
+        prophet = prophet(value ~ season(period = 12))
+)
+
+fabletools::accuracy(fit) # accuracy in the training set (in sample), based on one-step ahead forecast errors
+
+fit$arima
+fit$ets
+
+fit %>% select(arima) %>% gg_tsresiduals()
+fit %>% select(manual_arima) %>% gg_tsresiduals()
+fit %>% select(ets) %>% gg_tsresiduals()
+fit %>% select(lm) %>% gg_tsresiduals()
+fit %>% select(prophet) %>% gg_tsresiduals()
+```
+
+## Automatic forecasting
+
+We can forecast all the models at the same time, with the corresponding prediction intervals
+
+Note the forecast object is a table containing, for each model, the estimated probability distribution of the target for each ahead-period $h$, and the corresponding mean (point forecast)
+
+```{r}
+# Forecasts 24 months ahead
+fc = fit %>% forecast(h = 24) 
+fc
+```
+
+The autoplot() plots the forecasts for all models
+
+```{r}
+fc %>% 
+  autoplot(filter(gtemp_ts, year(index)>=2018), size=1.5, level = NULL) +
+  labs(title = "Global monthly-mean temperature anomaly",subtitle='Monthly forecasts for 2023 and 2024', x='', y = '°C') + theme_minimal()
+
+# The linear model is performing the best
+```
+
+Prediction intervals (by default, level=c(80,95) so 80% and 95% prediction intervals are shown)
+
+```{r}
+fc %>% hilo(level = c(80, 95))
+```
+
+Accuracy in the testing set (out of sample)
+
+```{r}
+fc %>% fabletools::accuracy(gtemp_ts) 
+```
+
+Insights?
+
+## What is the long-term forecast by the automatic.arima model?
+
+```{r}
+fit <- gtemp_ts %>% 
+  filter(year(index)>1980) %>% 
+  model(manual_arima = ARIMA(value ~ 0 + pdq(0,1,1) + PDQ(0,1,1)))
+  #model(arima = ARIMA(value))
+
+fit$manual_arima
+#fit$arima 
+
+# Forecasts 10 years ahead
+fit %>% forecast(h = 120) %>% 
+  autoplot(filter(gtemp_ts, year(index)>=2000), size=1.5) +
+  labs(title = "Global monthly-mean temperature anomaly",subtitle='Monthly forecasts in the long term', x='', y = '°C') + theme_minimal()
+
+```
+
+Insights?
+
+## modeltime
+
+The **modeltime** package also considers tidy data, and build the time-series models using the `Tidymodels` (new caret)
+
+Hence, better to get some basic skills using `tidymodels`: <https://www.tidymodels.org/start/>
+
+With `modeltime`, we can train many models at the same time (arima, prophet, random forests, xgboost, neural networks, etc.)
+
+Developed by Matt Dancho: <https://business-science.github.io/modeltime/>
+
+```{r}
+# we need to change the format of the index date
+gtemp_ts$index = as.Date(gtemp_ts$index)
+
+gtemp_ts %>%
+  plot_time_series(index, value, .interactive = FALSE) +
+  labs(title = 'Global monthly-mean temperature anomaly', subtitle="°C deviations from the corresponding 1951-1980 means",
+       caption = "Data from https://data.giss.nasa.gov/gistemp", x = '', y = '°C') + theme_minimal()
+
+```
+
+In an easy way, we can split the time series into training and testing sets (using the `timetk` library)
+
+### Train-test split (just once)
+
+Last 12-months of data as the testing set, the other 10 years is the training
+
+```{r}
+# forecasting horizon = 1 year
+# estimation window = 10 years
+
+splits <- gtemp_ts %>%
+  time_series_split(date_var = index, initial = "15 years", assess  = "1 year")
+
+# visualize the split
+splits %>%
+  tk_time_series_cv_plan() %>%
+  plot_time_series_cv_plan(index, value, .interactive = FALSE)
+
+```
+
+### Time-series cross-validation (many splits)
+
+```{r}
+# forecasting horizon = 1 year
+# estimation window = 15 years, always fixed (cumulative=F)
+# forecast every 2 years
+
+splits <- time_series_cv(data = filter(gtemp_ts, year(index)>=2000), 
+                         date_var = index,
+                         initial     = "15 years",
+                         assess      = "1 year",
+                         skip        = "24 months",
+                         cumulative  = FALSE)
+
+# visualize the splits
+splits %>%
+    plot_time_series_cv_plan(index, value, .interactive = FALSE)
+
+```
+
+### Train
+
+Train the models in an automatic way: first an auto.arima, then with prophet
+
+We are going to select the first split (to forecast the last recent year), but we can select any other, or even all the splits with a loop
+
+```{r}
+sp = 1 # select here the split
+
+# First the auto.arima of Hyndman
+model_fit_arima = 
+  # arima_reg() %>% 
+  arima_reg(seasonal_period = 12, non_seasonal_differences = 1) %>%
+  set_engine("auto_arima") %>%
+  fit(value ~ index, training(splits$splits[[sp]])) 
+# modeltime models require a date column to be a regressor
+
+model_fit_arima
+
+# Now the prophet by facebook
+model_fit_prophet <- prophet_reg() %>%
+  set_engine("prophet", monthly.seasonality = TRUE) %>%
+  fit(value ~ index, training(splits$splits[[sp]]))
+model_fit_prophet
+
+# Now our manual benchmark: MA(1)xMA(1)_12
+model_fit_ma1 = 
+  # arima_reg() %>% 
+  arima_reg(
+        seasonal_period          = 12,
+        non_seasonal_ar          = 0,
+        non_seasonal_differences = 1,
+        non_seasonal_ma          = 1,
+        seasonal_ar              = 0,
+        seasonal_differences     = 1,
+        seasonal_ma              = 1
+    ) %>%
+  set_engine("arima") %>%
+  fit(value ~ index, training(splits$splits[[sp]])) 
+
+```
+
+The modeltime table organizes the models with IDs and creates generic descriptions to help us keep track of our models
+
+```{r}
+model_table <- modeltime_table(
+  model_fit_arima, 
+  model_fit_prophet,
+  model_fit_ma1
+) 
+model_table
+```
+
+### Forecasting
+
+First, model calibration is used to quantify error and estimate confidence intervals
+
+Model calibration will be performed on the out-of-sample data (testing sets) with the modeltime_calibrate() function
+
+```{r}
+calibration_table <- model_table %>%
+  modeltime_calibrate(testing(splits$splits[[sp]]))
+calibration_table
+```
+
+Now, with calibrated data, we can forecast all the models
+
+```{r}
+calibration_table %>%
+  modeltime_forecast(actual_data = filter(gtemp_ts,year(index)>=2019)) %>%
+  plot_modeltime_forecast(.interactive = FALSE) + labs(title = "Forecasts",    y = "",    caption = "modeltime"      )
+```
+
+Accuracy table in the first testing set:
+
+```{r}
+calibration_table %>%
+  modeltime_accuracy() %>%
+  table_modeltime_accuracy(.interactive = FALSE)
+```
+
+In this case, an auto.arima works better, but very similar than manual arima
+
+## Long-term forecasts
+
+```{r}
+calibration_table %>%
+  modeltime_forecast(h=120) %>%
+  plot_modeltime_forecast(.interactive = FALSE, .conf_interval_show = FALSE) + labs(title = "Forecasts",    y = "",    caption = "modeltime"      )
+```
+
+Insights?
